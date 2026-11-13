@@ -1,0 +1,7 @@
+# Deployment artifacts (never commit these)
+*.pem
+*.tar.gz
+
+# OS / editor
+.DS_Store
+Thumbs.db

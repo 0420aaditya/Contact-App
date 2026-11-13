@@ -1,0 +1,174 @@
+AWSTemplateFormatVersion: "2010-09-09" # CloudFormation template format version (the only valid value)
+Description: One Amazon Linux 2023 EC2 instance hosting the MERN Contact App - nginx serves the React build and reverse-proxies the Express API, with MongoDB installed locally. # Shown in the CloudFormation console
+
+Parameters: # Inputs that can be changed at deploy time
+  InstanceType: # Parameter for the EC2 size
+    Type: String # Value is plain text
+    Default: t3.small # MongoDB needs memory, so t3.small (2 GB) is the safer default
+    AllowedValues: [t2.micro, t2.small, t2.medium, t3.micro, t3.small, t3.medium] # Only these sizes are accepted (lab-friendly)
+    Description: EC2 instance size. # Help text shown in the console
+  SSHLocation: # Parameter for who can SSH in
+    Type: String # Value is plain text
+    Default: 0.0.0.0/0 # Allows SSH from any IP; change to your-ip/32 to restrict
+    AllowedPattern: '^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$' # Must look like a CIDR, e.g. 1.2.3.4/32
+    Description: CIDR allowed to SSH to the instance. Restrict to your IP (x.x.x.x/32) where possible. # Help text shown in the console
+  LatestAmiId: # Parameter for the OS image
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id> # Reads the AMI ID from an SSM parameter at deploy time
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64 # AWS public parameter that always points to the latest Amazon Linux 2023 AMI
+    Description: Public SSM parameter resolving to the latest Amazon Linux 2023 AMI. # Help text shown in the console
+
+Resources: # AWS resources this stack creates
+  KeyPair: # Logical name of the SSH key pair
+    Type: AWS::EC2::KeyPair # Creates an EC2 key pair; private key is saved in SSM at /ec2/keypair/<KeyPairId>
+    Properties: # Settings for the key pair
+      KeyName: !Sub "${AWS::StackName}-key" # Key name built from the stack name
+
+  SecurityGroup: # Logical name of the firewall
+    Type: AWS::EC2::SecurityGroup # Creates a security group in the default VPC
+    Properties: # Settings for the security group
+      GroupDescription: Allow SSH and HTTP # Required description text
+      SecurityGroupIngress: # Inbound rules
+        - IpProtocol: tcp # Rule 1 uses TCP
+          FromPort: 22 # Start of port range: SSH
+          ToPort: 22 # End of port range: SSH only
+          CidrIp: !Ref SSHLocation # Allowed source IPs come from the SSHLocation parameter
+        - IpProtocol: tcp # Rule 2 uses TCP
+          FromPort: 80 # Start of port range: HTTP
+          ToPort: 80 # End of port range: HTTP only
+          CidrIp: 0.0.0.0/0 # Anyone can reach port 80 (nginx proxies the API internally on 8000)
+
+  Instance: # Logical name of the EC2 instance
+    Type: AWS::EC2::Instance # Creates an EC2 virtual machine
+    Properties: # Settings for the instance
+      ImageId: !Ref LatestAmiId # OS image = latest Amazon Linux 2023 from the parameter
+      InstanceType: !Ref InstanceType # Size comes from the InstanceType parameter
+      KeyName: !Ref KeyPair # Attaches the key pair above so we can SSH in
+      BlockDeviceMappings: # Root disk settings (set explicitly because the lab policy blocked the default gp3 disk)
+        - DeviceName: /dev/xvda # Root device name used by Amazon Linux
+          Ebs: # The disk is an EBS volume
+            VolumeType: gp2 # gp2 disk type (lab policy denied the default gp3)
+            VolumeSize: 10 # Disk size in GB (leaves room for MongoDB data and node_modules)
+            DeleteOnTermination: true # Delete the disk when the instance is deleted
+      SecurityGroupIds: # Security groups attached to the instance
+        - !GetAtt SecurityGroup.GroupId # Uses the security group created above
+      UserData: # Script that runs once, on the instance's first boot
+        Fn::Base64: | # EC2 expects the script base64-encoded; "|" keeps the lines as written
+          #!/bin/bash
+          set -euo pipefail # Stop on the first error (shows in /var/log/cloud-init-output.log)
+
+          # --- nginx (serves the React build and proxies the API) ---
+          dnf install -y nginx # Install the nginx web server
+          chown -R ec2-user:ec2-user /usr/share/nginx/html # Let ec2-user replace the site files without sudo
+
+          # --- Node.js (runs the Express backend) ---
+          dnf install -y nodejs22 || dnf install -y nodejs20 || dnf install -y nodejs # Prefer Node 22, fall back to 20 or the default
+
+          # --- MongoDB (local database) ---
+          cat > /etc/yum.repos.d/mongodb-org-7.0.repo <<'REPO' # Add the official MongoDB repository for Amazon Linux 2023
+          [mongodb-org-7.0]
+          name=MongoDB Repository
+          baseurl=https://repo.mongodb.org/yum/amazon/2023/mongodb-org/7.0/x86_64/
+          gpgcheck=1
+          enabled=1
+          gpgkey=https://www.mongodb.org/static/pgp/server-7.0.asc
+          REPO
+          dnf install -y mongodb-org # Install the MongoDB server and tools
+          systemctl enable --now mongod # Start MongoDB now and on every reboot
+
+          # --- app directories ---
+          mkdir -p /opt/contact-app/backend/uploads # Backend code + uploaded photos live here
+          chown -R ec2-user:ec2-user /opt/contact-app # Let ec2-user (the workflow's SSH user) write here
+
+          # --- nginx site: serve the build, proxy /api and /uploads to the backend ---
+          cat > /etc/nginx/nginx.conf <<'NGINX'
+          user nginx;
+          worker_processes auto;
+          error_log /var/log/nginx/error.log;
+          pid /run/nginx.pid;
+
+          events {
+              worker_connections 1024;
+          }
+
+          http {
+              include /etc/nginx/mime.types;
+              default_type application/octet-stream;
+
+              log_format main '$remote_addr - $remote_user [$time_local] "$request" '
+                              '$status $body_bytes_sent "$http_referer" '
+                              '"$http_user_agent" "$http_x_forwarded_for"';
+              access_log /var/log/nginx/access.log main;
+
+              sendfile on;
+              keepalive_timeout 65;
+              gzip on;
+
+              server {
+                  listen 80 default_server;
+                  server_name _;
+                  root /usr/share/nginx/html;
+                  index index.html;
+
+                  location /api/ {
+                      proxy_pass http://127.0.0.1:8000/;
+                      proxy_http_version 1.1;
+                      proxy_set_header Host $host;
+                      proxy_set_header X-Real-IP $remote_addr;
+                      proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  }
+
+                  location /uploads/ {
+                      proxy_pass http://127.0.0.1:8000/uploads/;
+                  }
+
+                  location / {
+                      try_files $uri $uri/ /index.html;
+                  }
+              }
+          }
+          NGINX
+          systemctl enable --now nginx # Start nginx now and on every reboot
+
+          # --- backend systemd service (started by the workflow after the code is copied) ---
+          cat > /etc/systemd/system/contact-app.service <<'SERVICE'
+          [Unit]
+          Description=Contact App backend (Express)
+          After=network.target mongod.service
+          Wants=mongod.service
+
+          [Service]
+          Type=simple
+          User=ec2-user
+          WorkingDirectory=/opt/contact-app/backend
+          ExecStart=/usr/bin/node index.js
+          Restart=on-failure
+          RestartSec=3
+
+          [Install]
+          WantedBy=multi-user.target
+          SERVICE
+          systemctl daemon-reload # Re-read unit files
+          systemctl enable contact-app # Enable so it starts on boot (the workflow starts it after deploying)
+      Tags: # Labels on the instance
+        - Key: Name # The "Name" tag is what the EC2 console shows
+          Value: !Sub "${AWS::StackName}-instance" # e.g. contact-app-stack-instance
+
+Outputs: # Values shown after deployment (printed by the workflow)
+  InstanceId: # Output name
+    Description: EC2 instance ID # What this output is
+    Value: !Ref Instance # Returns the instance ID
+  PublicIp: # Output name
+    Description: Public IP of the instance # What this output is
+    Value: !GetAtt Instance.PublicIp # Returns the public IP, used for SSH
+  PublicDns: # Output name
+    Description: Public DNS name of the instance # What this output is
+    Value: !GetAtt Instance.PublicDnsName # Returns the public DNS name
+  KeyPairId: # Output name
+    Description: Key pair ID; the private key is stored in SSM Parameter Store at /ec2/keypair/<KeyPairId> # What this output is
+    Value: !GetAtt KeyPair.KeyPairId # Returns the key pair ID, needed to fetch the private key
+  KeyName: # Output name
+    Description: Name of the EC2 key pair # What this output is
+    Value: !Ref KeyPair # Returns the key pair name
+  WebsiteURL: # Output name
+    Description: URL of the app (the IP changes if the instance is stopped and started; the workflow always prints the current one) # What this output is
+    Value: !Sub "http://${Instance.PublicIp}" # Builds the URL from the public IP
