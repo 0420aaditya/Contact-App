@@ -156,8 +156,14 @@ jobs: # Jobs in this workflow
           IP: ${{ steps.instance.outputs.ip }} # Instance IP from the earlier step
         run: | # Multi-line shell script
           curl -fsS --retry 5 --retry-delay 3 "http://$IP" | grep -q 'id="root"' # Fail if nginx doesn't serve the React page
-          code=$(curl -s -o /dev/null -w "%{http_code}" "http://$IP/api/contacts") # Call the API through the proxy
-          if [ "$code" != "401" ] && [ "$code" != "200" ]; then # 401 means the backend is up and asking for a token
+          code="" # HTTP status returned by the API call
+          for i in $(seq 1 10); do # The backend needs a moment after restart to connect to MongoDB and bind port 8000
+            code=$(curl -s -o /dev/null -w "%{http_code}" "http://$IP/api/contacts") # Call the API through the proxy
+            if [ "$code" = "401" ] || [ "$code" = "200" ]; then break; fi # 401 means the backend is up and asking for a token
+            echo "API not ready yet (HTTP $code), retrying in 3s..." # Progress message
+            sleep 3 # Wait before the next try
+          done
+          if [ "$code" != "401" ] && [ "$code" != "200" ]; then # Still not responding after the retries
             echo "::error::Backend API not responding (HTTP $code)" # Red annotation on the run page
             exit 1 # Fail the step
           fi
