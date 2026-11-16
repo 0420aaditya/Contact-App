@@ -151,6 +151,12 @@ jobs: # Jobs in this workflow
           EOF
           ssh $SSH_OPTS ec2-user@"$IP" 'sudo systemctl restart contact-app' # Restart the backend so it picks up the new code and .env
 
+      - name: Seed admin user if the database is empty # Step name shown in the log
+        env: # Variables for this step
+          IP: ${{ steps.instance.outputs.ip }} # Instance IP from the earlier step
+        run: | # Multi-line shell script
+          ssh $SSH_OPTS ec2-user@"$IP" "cd $APP_DIR && node src/seedAdmin.js" # Creates admin@example.com / Admin@123 only when no user exists
+
       - name: Check the app is live # Step name shown in the log
         env: # Variables for this step
           IP: ${{ steps.instance.outputs.ip }} # Instance IP from the earlier step
